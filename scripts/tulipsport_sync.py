@@ -19,55 +19,52 @@ from generator import Generator
 from utils import adjust_time, adjust_time_to_utc
 
 # need to test
-ACTIVITY_LIST_API = "https://open.tulipsport.com/api/v1/feeds4likes?start_time={start_time}&end_time={end_time}&from_id={from_id}"
+ACTIVITY_LIST_API = "https://open.tulipsport.com/api/v1/feeds4likes?start_time={start_time}&end_time={end_time}"
 ACTIVITY_DETAIL_API = "https://open.tulipsport.com/api/v1/feeddetail?activity_id={activity_id}"
+TULIPSPORT_FAKE_ID_PREFIX = "666"
 
 TIMEZONE_OFFSET = "+08:00"
 TIMEZONE_NAME = "Asia/Shanghai"
 DEFAULT_TIMEZONE = timezone(timedelta(hours=8), TIMEZONE_NAME)
 
-def get_all_activity_summaries(session, headers):
-  from_id = ""
-  start_time = "2015-01-01 00:00:00"
-  end_time = datetime.now(tz=DEFAULT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+def get_all_activity_summaries(session, headers, start_time=None):
+  if start_time is None:
+    start_time = datetime.fromisoformat('2015-01-01T00:00:00+08:00')
+  start_time_str = start_time.strftime("%Y-%m-%d %H:%M:%S")
+  end_time_str = datetime.now(tz=DEFAULT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
   result = []
-  while 1:
-    r = session.get(ACTIVITY_LIST_API.format(start_time=quote(start_time), end_time=quote(end_time), from_id=from_id),
-                    headers=headers)
-    if r.ok:
-      data = r.json()
-      if data["code"] == 0:
-        summary_list = data["msg"]
-        for summary in summary_list:
-          if summary["activity_type"] != "run":
-            continue
-          start_date_local = datetime.fromisoformat(summary["start_date_local"] + TIMEZONE_OFFSET)
-          start_date = adjust_time_to_utc(start_date_local, TIMEZONE_NAME)
-          moving_time = timedelta(seconds=int(summary["moving_time"]))
-          distance = float(summary["activity_distance"]) * 1000
-          result.append({
-            "id": build_tulipsport_int_activity_id(summary),
-            "aid": summary["activity_id"],
-            "name": "run from tulipsport by " + summary["device"],
-            "distance": distance,
-            "moving_time": moving_time,
-            "elapsed_time": moving_time,
-            "type": "Run",
-            "start_date": start_date,
-            "start_date_local": start_date_local,
-            "end_date": start_date + moving_time,
-            "start_date_local": start_date_local + moving_time,
-            "average_heartrate": None,
-            "average_speed": distance / int(summary["moving_time"]),
-            "summary_polyline": "",
-            "outdoor": summary["location"] != ',,'
-          })
-        summary_list_length = len(summary_list)
-        # 接口全量返回，非分页模式
-        # if summary_list_length < 25 or summary_list_length == 0:
-        break
-        from_id = summary_list[-1]["activity_id"]
-        time.sleep(1)  # spider rule
+  # 接口全量返回，非分页模式
+  r = session.get(ACTIVITY_LIST_API.format(start_time=quote(start_time_str), end_time=quote(end_time_str)),
+                  headers=headers)
+  if r.ok:
+    data = r.json()
+    if data["code"] == 0:
+      summary_list = data["msg"]
+      for summary in summary_list:
+        if summary["activity_type"] != "run":
+          continue
+        start_date_local = datetime.fromisoformat(summary["start_date_local"] + TIMEZONE_OFFSET)
+        start_date = adjust_time_to_utc(start_date_local, TIMEZONE_NAME)
+        moving_time = timedelta(seconds=int(summary["moving_time"]))
+        distance = float(summary["activity_distance"]) * 1000
+        result.append({
+          "id": build_tulipsport_int_activity_id(summary),
+          "aid": summary["activity_id"],
+          "name": "run from tulipsport by " + summary["device"],
+          "distance": distance,
+          "moving_time": moving_time,
+          "elapsed_time": moving_time,
+          "type": "Run",
+          "start_date": start_date,
+          "start_date_local": start_date_local,
+          "end_date": start_date + moving_time,
+          "start_date_local": start_date_local + moving_time,
+          "average_heartrate": None,
+          "average_speed": distance / int(summary["moving_time"]),
+          "summary_polyline": "",
+          "outdoor": summary["location"] != ',,'
+        })
+      summary_list_length = len(summary_list)
   return result
 
 def get_activity_detail(session, headers, activity_id):
@@ -120,12 +117,20 @@ def merge_summary_and_detail_to_nametuple(summary, detail):
   }
   return namedtuple("activity_db_instance", activity_db_instance.keys())(*activity_db_instance.values())
 
+def find_last_tulipsport_start_time(track_ids):
+  start_time = None
+  tulipsport_ids = [id for id in track_ids if str(id).startswith(TULIPSPORT_FAKE_ID_PREFIX)]
+  if tulipsport_ids:
+    tulipsport_ids.sort()
+    start_time = datetime.fromtimestamp(int(str(tulipsport_ids[0])[3: -6]), DEFAULT_TIMEZONE)
+  return start_time
+
 def get_new_activities(token, old_tracks_ids):
   s = requests.Session()
   headers = {
     "Authorization": token
   }
-  activity_summary_list = get_all_activity_summaries(s, headers)
+  activity_summary_list = get_all_activity_summaries(s, headers, find_last_tulipsport_start_time(old_tracks_ids))
   activity_summary_list = [activity for activity in activity_summary_list if activity["id"] not in old_tracks_ids]
   print(f"{len(activity_summary_list)} new activities to generate")
   tracks = []
@@ -142,13 +147,12 @@ def get_new_activities(token, old_tracks_ids):
       print(f"Something wrong paring tulipsport id {activity_id} " + str(e))
   return tracks
 
-# 郁金香运动的活动ID采用UUID模式，而DB主键使用int类型，无法有效存储，所以采用构造个人唯一的活动ID
+# 郁金香运动的活动ID采用UUID模式，而DB主键使用long类型，无法有效存储，所以采用构造个人唯一的活动ID
 # 模拟构造ID = 特殊前缀 + 活动开始时间的timestamp + 活动距离（单位：米）
 def build_tulipsport_int_activity_id(activity):
   timestamp_str = str(int(datetime.fromisoformat(activity["start_date_local"] + '+08:00').timestamp()))
-  print(activity["activity_distance"], float(activity["activity_distance"]), f'{int(float(activity["activity_distance"]) * 1000):0>6}')
   distance_str = f'{int(float(activity["activity_distance"]) * 1000):0>6}'
-  return '666' + timestamp_str + distance_str
+  return TULIPSPORT_FAKE_ID_PREFIX + timestamp_str + distance_str
 
 def sync_tulipsport_activites(token):
   generator = Generator(SQL_FILE)
